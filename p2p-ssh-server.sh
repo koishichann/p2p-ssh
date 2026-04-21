@@ -1,68 +1,70 @@
 #!/bin/bash
-# P2P SSH 服务端 - 家里WSL（Agent专用）
-# 定制功能：60次打洞包、连接建立即停发、5分钟无连接自动清理、无无限发包
 set -e
 
-# ========== 你的自定义参数（已按要求设置） ==========
-MAX_PUNCH_COUNT=60        # 最大打洞包次数
-PUNCH_INTERVAL=1          # 打洞包间隔(秒)
-SOCAT_TIMEOUT=300         # 无流量自动关闭(秒) = 5分钟
-# ====================================================
+# 配置项
+MAX_PUNCH_COUNT=60
+PUNCH_INTERVAL=1
+SOCAT_TIMEOUT=300
+# 日志：当前目录 + 追加写入 + 带时间戳
+LOG_FILE="./p2p-server.log"
 
-# 校验参数
+# 参数校验
 [ $# -ne 1 ] && echo "用法：$0 客户端IP:PORT" && exit 1
 CLIENT_IP=$(echo "$1" | cut -d: -f1)
 CLIENT_PORT=$(echo "$1" | cut -d: -f2)
-
-# 校验root权限
-[ $(id -u) -ne 0 ] && echo "错误：请用 root 运行" && exit 1
+[ $(id -u) -ne 0 ] && echo "请用root运行" && exit 1
 
 # 自动安装socat
 install_socat() {
   command -v socat &>/dev/null && return
   if command -v yum &>/dev/null; then
     yum install socat -y
-  elif command -v apt &>/dev/null; then
+  else
     apt update && apt install socat -y
   fi
 }
 install_socat
 
-# 端口配置
+# 生成端口 + 获取公网IP
 PORT2=$((50000 + RANDOM % 15535))
-IP2=$(curl -s ip.sb || echo "获取公网IP失败")
+IP2=$(curl -s ip.sb || echo "获取失败")
 PID_FILE="/tmp/p2p-socat.pid"
-COUNT=0  # 实际发送打洞包次数
 
-# 清理历史残留进程
-[ -f "$PID_FILE" ] && kill $(cat "$PID_FILE") 2>/dev/null && rm -f "$PID_FILE"
+# 清理历史进程（日志保留，仅杀进程）
+rm -f $PID_FILE
+pkill -f "socat.*$PORT2" 2>/dev/null
 
-# 启动SSH隧道（后台运行，无流量5分钟自动关闭）
+# ======================================
+# 核心：立即输出，Agent 直接获取
+# ======================================
+echo "你的公网地址: $IP2:$PORT2"
+echo "自动清理: 5分钟无连接自动关闭"
+
+# 后台启动隧道（自动超时关闭）
 socat UDP-LISTEN:$PORT2,fork,reuseaddr TCP:127.0.0.1:22 -T $SOCAT_TIMEOUT &
 SOCAT_PID=$!
-echo "$SOCAT_PID" > "$PID_FILE"
+echo $SOCAT_PID > $PID_FILE
 
-# 核心：有限次数打洞 + 检测到连接立即停止发包
+# ======================================
+# 后台打洞 + 日志追加写入(带时间) + 不干扰终端
+# ======================================
 (
+  COUNT=0
+  # 标准输出/错误 追加到日志
+  exec >> $LOG_FILE 2>&1
   while [ $COUNT -lt $MAX_PUNCH_COUNT ]; do
-    # 检测：如果隧道已建立连接（有SSH流量），立即停止发送打洞包
-    if ss -au | grep ":${PORT2}" | grep -q ESTABLISHED; then
+    if ss -au | grep -q ":${PORT2}.*ESTABLISHED"; then
+      # 带时间戳输出成功日志
+      echo "[$(date '+%Y-%m-%d %H:%M:%S')] ✅ P2P 隧道连接成功"
+      echo "[$(date '+%Y-%m-%d %H:%M:%S')] 📶 对端客户端: $CLIENT_IP:$CLIENT_PORT"
+      echo "[$(date '+%Y-%m-%d %H:%M:%S')] 打洞包已发送: ${COUNT}次（最大60次）"
       break
     fi
     echo -n ""
-    COUNT=$((COUNT + 1))
+    COUNT=$((COUNT+1))
     sleep $PUNCH_INTERVAL
   done
-
-  # ========== 按你要求新增输出：成功提示 + 客户端信息 ==========
-  echo -e "\n✅ P2P 隧道连接已建立成功！"
-  echo "📶 对端客户端信息：${CLIENT_IP}:${CLIENT_PORT}"
-  # ============================================================
-  echo "打洞包已发送: ${COUNT}次（最大发送${MAX_PUNCH_COUNT}次）"
 ) | socat UDP:$CLIENT_IP:$CLIENT_PORT - &
 
-# 主脚本立即退出，不阻塞Agent
-echo -e "\n========= 服务端运行成功 =========="
-echo "你的公网地址: $IP2:$PORT2"
-echo "自动清理: 5分钟无连接自动关闭隧道"
-echo "==================================="
+# 脚本立即退出
+exit 0
