@@ -1,19 +1,28 @@
 #!/bin/bash
 set -e
-# 退出时自动清理进程
-trap 'echo -e "\n[$(date '+%Y-%m-%d %H:%M:%S')] 🔌 隧道已断开"; pkill -f "socat.*$SSH_PORT" 2>/dev/null; exit 0' INT
 
 # 配置项
 CLIENT_LOG="./p2p-client.log"
-MAX_DETECT_SECOND=30  # 最大检测时长30秒，防止无限循环
+# 记录当前脚本的PID（父进程PID）
+MAIN_PID=$$
+
+# 清理函数：Ctrl+C/退出时 杀死所有子进程（检测进程+socat）
+cleanup() {
+    echo -e "\n[$(date '+%Y-%m-%d %H:%M:%S')] 🔌 隧道已断开，正在清理进程..."
+    # 杀死当前脚本的所有子进程（检测进程 + socat）
+    pkill -P $MAIN_PID 2>/dev/null
+    exit 0
+}
+# 绑定信号：Ctrl+C / 进程终止 都触发清理
+trap cleanup INT TERM
 
 # 检查root
 [ $(id -u) -ne 0 ] && echo "请用root运行" && exit 1
 
-# 安装socat
+# 自动安装socat
 install_socat() {
-  command -v socat &>/dev/null && return
-  apt update && apt install socat -y || yum install socat -y
+    command -v socat &>/dev/null && return
+    apt update && apt install socat -y || yum install socat -y
 }
 install_socat
 
@@ -34,29 +43,29 @@ IP2=$(echo "$addr" | cut -d: -f1)
 PORT2=$(echo "$addr" | cut -d: -f2)
 [ -z "$IP2" ] || [ -z "$PORT2" ] && echo "格式错误" && exit 1
 
-# ======================================
-# 后台检测连接：限时30秒 + 带时间 + 日志追加
-# ======================================
-(
-  USE_TIME=0
-  exec >> $CLIENT_LOG 2>&1  # 日志追加写入
-  while [ $USE_TIME -lt $MAX_DETECT_SECOND ]; do
-    sleep 1
-    USE_TIME=$((USE_TIME+1))
-    if ss -tuln | grep -q ":$SSH_PORT"; then
-      # 终端输出（带时间）
-      echo -e "\n[$(date '+%Y-%m-%d %H:%M:%S')] ✅ 客户端已成功连接到服务端隧道！"
-      echo "[$(date '+%Y-%m-%d %H:%M:%S')] 🚀 连接命令：ssh root@127.0.0.1 -p $SSH_PORT"
-      # 日志写入（带时间）
-      echo "[$(date '+%Y-%m-%d %H:%M:%S')] ✅ 客户端隧道连接成功，本地端口：$SSH_PORT"
-      break
-    fi
-  done
-  # 超时日志
-  if [ $USE_TIME -ge $MAX_DETECT_SECOND ]; then
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ⏰ 客户端检测超时（${MAX_DETECT_SECOND}秒）"
-  fi
-) &
+# ===================== 核心修复：检测进程绑定父进程PID =====================
+# 传入父进程PID，父进程死则检测进程自毁
+connection_detect() {
+    local parent_pid=$1
+    exec >> "$CLIENT_LOG" 2>&1
+    
+    while true; do
+        # 【关键】判断父进程是否存活（父进程死了，立即退出）
+        if ! kill -0 $parent_pid 2>/dev/null; then
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] 父进程已退出，检测进程自动关闭"
+            break
+        fi
+        # 检测隧道连通状态
+        if ss -tuln | grep -q ":$SSH_PORT" && ss -au | grep -q ":$PORT1"; then
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] ✅ 客户端隧道连接成功，本地端口：$SSH_PORT"
+        fi
+        sleep 2
+    done
+}
 
-# 启动隧道（前台阻塞）
-socat TCP-LISTEN:$SSH_PORT,fork,reuseaddr UDP:$IP2:$PORT2,sourceport=$PORT1
+# 后台启动检测，传入当前主进程PID（强绑定）
+connection_detect $MAIN_PID &
+
+# 前台启动隧道（阻塞运行，保持隧道永久开通）
+echo -e "\n[$(date '+%Y-%m-%d %H:%M:%S')] 正在连接服务端隧道..."
+socat TCP-LISTEN:"$SSH_PORT",fork,reuseaddr UDP:"$IP2":"$PORT2",sourceport="$PORT1"
